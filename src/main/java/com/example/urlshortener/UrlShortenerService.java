@@ -15,20 +15,51 @@ public class UrlShortenerService {
     private static final String ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
     private static final SecureRandom RANDOM = new SecureRandom();
 
+    private final ShortUrlRepository shortUrlRepository;
     private final Map<String, String> longToShort = new ConcurrentHashMap<>();
     private final Map<String, String> shortToLong = new ConcurrentHashMap<>();
+
+    public UrlShortenerService(ShortUrlRepository shortUrlRepository) {
+        this.shortUrlRepository = shortUrlRepository;
+    }
 
     public String shorten(String originalUrl) {
         String normalizedUrl = normalizeUrl(originalUrl);
 
-        return longToShort.computeIfAbsent(normalizedUrl, url -> {
-            String code = generateCode();
-            while (shortToLong.containsKey(code)) {
-                code = generateCode();
+        String existingShortUrl = longToShort.get(normalizedUrl);
+        if (existingShortUrl != null) {
+            return existingShortUrl;
+        }
+
+        try {
+            String existingCode = shortUrlRepository.findByOriginalUrl(normalizedUrl)
+                    .map(ShortUrlDocument::code)
+                    .orElse(null);
+            if (existingCode != null) {
+                String shortUrl = BASE_URL + existingCode;
+                longToShort.putIfAbsent(normalizedUrl, shortUrl);
+                shortToLong.putIfAbsent(existingCode, normalizedUrl);
+                return shortUrl;
             }
-            shortToLong.put(code, url);
-            return BASE_URL + code;
-        });
+        } catch (Exception ignored) {
+            // Fall back to in-memory storage if the MongoDB Atlas cluster is unavailable.
+        }
+
+        String code = generateCode();
+        while (shortToLong.containsKey(code) || repositoryContainsCode(code)) {
+            code = generateCode();
+        }
+
+        String shortUrl = BASE_URL + code;
+        try {
+            shortUrlRepository.save(new ShortUrlDocument(code, normalizedUrl));
+        } catch (Exception ignored) {
+            // Fall back to local memory when MongoDB is not reachable.
+        }
+
+        shortToLong.putIfAbsent(code, normalizedUrl);
+        longToShort.putIfAbsent(normalizedUrl, shortUrl);
+        return shortUrl;
     }
 
     public String resolve(String code) {
@@ -37,14 +68,33 @@ public class UrlShortenerService {
         }
 
         String originalUrl = shortToLong.get(code);
-        if (originalUrl == null) {
-            throw new IllegalArgumentException("Short code does not exist");
+        if (originalUrl != null) {
+            return originalUrl;
         }
-        return originalUrl;
+
+        try {
+            return shortUrlRepository.findByCode(code)
+                    .map(ShortUrlDocument::originalUrl)
+                    .orElseThrow(() -> new IllegalArgumentException("Short code does not exist"));
+        } catch (Exception e) {
+            throw new IllegalArgumentException("Short code does not exist", e);
+        }
     }
 
     public int count() {
-        return shortToLong.size();
+        try {
+            return (int) shortUrlRepository.count();
+        } catch (Exception ignored) {
+            return shortToLong.size();
+        }
+    }
+
+    private boolean repositoryContainsCode(String code) {
+        try {
+            return shortUrlRepository.existsByCode(code);
+        } catch (Exception ignored) {
+            return false;
+        }
     }
 
     private String normalizeUrl(String originalUrl) {
