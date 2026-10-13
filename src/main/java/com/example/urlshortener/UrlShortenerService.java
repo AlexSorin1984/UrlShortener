@@ -1,5 +1,6 @@
 package com.example.urlshortener;
 
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.net.URI;
@@ -13,14 +14,18 @@ public class UrlShortenerService {
 
     private static final String BASE_URL = "http://localhost:8080/go/";
     private static final String ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    private static final String ORIGINAL_TO_CODE_KEY = "short-url:original-to-code";
+    private static final String CODE_TO_ORIGINAL_KEY = "short-url:code-to-original";
     private static final SecureRandom RANDOM = new SecureRandom();
 
     private final ShortUrlRepository shortUrlRepository;
+    private final RedisTemplate<String, String> redisTemplate;
     private final Map<String, String> longToShort = new ConcurrentHashMap<>();
     private final Map<String, String> shortToLong = new ConcurrentHashMap<>();
 
-    public UrlShortenerService(ShortUrlRepository shortUrlRepository) {
+    public UrlShortenerService(ShortUrlRepository shortUrlRepository, RedisTemplate<String, String> redisTemplate) {
         this.shortUrlRepository = shortUrlRepository;
+        this.redisTemplate = redisTemplate;
     }
 
     public String shorten(String originalUrl) {
@@ -31,12 +36,21 @@ public class UrlShortenerService {
             return existingShortUrl;
         }
 
+        String cachedCode = getCachedCode(normalizedUrl);
+        if (cachedCode != null) {
+            String shortUrl = BASE_URL + cachedCode;
+            longToShort.putIfAbsent(normalizedUrl, shortUrl);
+            shortToLong.putIfAbsent(cachedCode, normalizedUrl);
+            return shortUrl;
+        }
+
         try {
             String existingCode = shortUrlRepository.findByOriginalUrl(normalizedUrl)
                     .map(ShortUrlDocument::code)
                     .orElse(null);
             if (existingCode != null) {
                 String shortUrl = BASE_URL + existingCode;
+                cacheShortUrl(existingCode, normalizedUrl);
                 longToShort.putIfAbsent(normalizedUrl, shortUrl);
                 shortToLong.putIfAbsent(existingCode, normalizedUrl);
                 return shortUrl;
@@ -46,7 +60,7 @@ public class UrlShortenerService {
         }
 
         String code = generateCode();
-        while (shortToLong.containsKey(code) || repositoryContainsCode(code)) {
+        while (shortToLong.containsKey(code) || repositoryContainsCode(code) || isCachedCode(code)) {
             code = generateCode();
         }
 
@@ -57,6 +71,7 @@ public class UrlShortenerService {
             // Fall back to local memory when MongoDB is not reachable.
         }
 
+        cacheShortUrl(code, normalizedUrl);
         shortToLong.putIfAbsent(code, normalizedUrl);
         longToShort.putIfAbsent(normalizedUrl, shortUrl);
         return shortUrl;
@@ -72,10 +87,18 @@ public class UrlShortenerService {
             return originalUrl;
         }
 
+        String cachedOriginalUrl = getCachedOriginalUrl(code);
+        if (cachedOriginalUrl != null) {
+            shortToLong.putIfAbsent(code, cachedOriginalUrl);
+            return cachedOriginalUrl;
+        }
+
         try {
-            return shortUrlRepository.findByCode(code)
+            String existingOriginalUrl = shortUrlRepository.findByCode(code)
                     .map(ShortUrlDocument::originalUrl)
                     .orElseThrow(() -> new IllegalArgumentException("Short code does not exist"));
+            cacheShortUrl(code, existingOriginalUrl);
+            return existingOriginalUrl;
         } catch (Exception e) {
             throw new IllegalArgumentException("Short code does not exist", e);
         }
@@ -86,6 +109,41 @@ public class UrlShortenerService {
             return (int) shortUrlRepository.count();
         } catch (Exception ignored) {
             return shortToLong.size();
+        }
+    }
+
+    private void cacheShortUrl(String code, String originalUrl) {
+        try {
+            redisTemplate.opsForHash().put(ORIGINAL_TO_CODE_KEY, originalUrl, code);
+            redisTemplate.opsForHash().put(CODE_TO_ORIGINAL_KEY, code, originalUrl);
+        } catch (Exception ignored) {
+            // Redis is optional for this app to remain functional.
+        }
+    }
+
+    private String getCachedCode(String originalUrl) {
+        try {
+            Object cachedCode = redisTemplate.opsForHash().get(ORIGINAL_TO_CODE_KEY, originalUrl);
+            return cachedCode == null ? null : cachedCode.toString();
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private String getCachedOriginalUrl(String code) {
+        try {
+            Object cachedOriginalUrl = redisTemplate.opsForHash().get(CODE_TO_ORIGINAL_KEY, code);
+            return cachedOriginalUrl == null ? null : cachedOriginalUrl.toString();
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private boolean isCachedCode(String code) {
+        try {
+            return Boolean.TRUE.equals(redisTemplate.opsForHash().hasKey(CODE_TO_ORIGINAL_KEY, code));
+        } catch (Exception ignored) {
+            return false;
         }
     }
 
